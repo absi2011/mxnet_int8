@@ -236,7 +236,7 @@ namespace op {
             DType int8_val = DType(floor(*(data + i) / quant_unit + 0.5));
             DType factor = int8_val > DType(QUANT_LEVEL / 2 - 1) ? DType(0.) : DType(1.);
             factor = int8_val < -DType(QUANT_LEVEL / 2) ? DType(0.) : factor;
-
+            //printf("%.10lf\n",*(gdata + i));
             *(out + i) = *(gdata + i) * factor;
         }
     };
@@ -425,6 +425,7 @@ void quantization_int8_act(std::string qmod, Tensor<gpu, 3, DType> data, Tensor<
             cudaFree(target_max);
             cudaFree(target_min);
         }
+        fflush(stdout);
         mxnet::op::mxnet_op::Kernel<mxnet::op::QUANT_WEIGHT_GPU_POWER2<DType>, gpu>::Launch(s, num,
             data.dptr_, out.dptr_,
             aux.dptr_);
@@ -432,14 +433,10 @@ void quantization_int8_act(std::string qmod, Tensor<gpu, 3, DType> data, Tensor<
 }
 
 template <typename DType>
-void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gpu, 3, DType> grad,
-                       Tensor<gpu, 3, DType> data, Tensor<gpu, 1, DType>& aux, Stream<gpu>* s)
+void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gpu, 3, DType> &grad,
+                       Tensor<gpu, 3, DType> &data, Tensor<gpu, 1, DType>& aux, Stream<gpu>* s)
 {
-
     int num = grad.size(0) * grad.size(1) * grad.size(2);
-    int offset = (num + 2 * THREAD_PER_BLOCK) / (2 * THREAD_PER_BLOCK);
-    DType* Temp;
-    cudaMalloc((void**)&Temp, sizeof(DType) * offset * 2);
     /*
   DType ori_grad_cpu[3];
   cudaMemcpy(ori_grad_cpu,grad.dptr_,sizeof(DType),cudaMemcpyDeviceToHost);
@@ -447,7 +444,20 @@ void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gp
   cudaMemcpy(ori_grad_cpu+2,gdata.dptr_,sizeof(DType),cudaMemcpyDeviceToHost);
   std::cout<<ori_grad_cpu[0]<<" "<<ori_grad_cpu[1]<<" "<<ori_grad_cpu[2]<<std::endl;
   */
-    //compute gradient for threash hold
+    /*
+    //Test Code
+    DType a[15];
+    cudaMemcpy(a, grad.dptr_, sizeof(DType) * num, cudaMemcpyDeviceToHost);
+    int i;
+    for (i=0;i<num;i++)
+    {
+        printf("%.7lf ",a[i]);
+    }
+    printf("\n");
+
+    printf("%lld %lld\n",(long long)grad.dptr_, (long long)gdata.dptr_);
+    //Test Code End
+    */
     mxnet::op::mxnet_op::Kernel<mxnet::op::GRAD_POWER2<DType>, gpu>::Launch(s, num, data.dptr_, grad.dptr_, gdata.dptr_, aux.dptr_);
     /*
   DType ori_grad_cpu[3];
@@ -457,6 +467,10 @@ void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gp
   std::cout<<ori_grad_cpu[0]<<" "<<ori_grad_cpu[1]<<" "<<ori_grad_cpu[2]<<std::endl;
   */
     //reduce gradient for threash hold
+    /*
+    int offset = (num + 2 * THREAD_PER_BLOCK) / (2 * THREAD_PER_BLOCK);
+    DType* Temp;
+    cudaMalloc((void**)&Temp, sizeof(DType) * offset * 2);
     int current_num = num;
     int pre_num;
     int current_i;
@@ -484,16 +498,21 @@ void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gp
             dst_grad = inter_media;
         }
     }
+    cudaFree(Temp);
+    */
     //compute grad
+    DType * res;
+    cudaMalloc((void**)&res, sizeof(DType));
+    DType temp = thrust::reduce(thrust::device, gdata.dptr_, gdata.dptr_ + num);
     mxnet::op::mxnet_op::Kernel<mxnet::op::GRAD_WEIGHT_POWER2<DType>, gpu>::Launch(s, num, data.dptr_, grad.dptr_, gdata.dptr_, aux.dptr_);
     //update aux
-    mxnet::op::mxnet_op::Kernel<mxnet::op::UPDATE_LOG2T<DType>, gpu>::Launch(s, 1, aux.dptr_, src_grad);
+    cudaMemcpy(res, &temp, sizeof(DType), cudaMemcpyHostToDevice);
+    mxnet::op::mxnet_op::Kernel<mxnet::op::UPDATE_LOG2T<DType>, gpu>::Launch(s, 1, aux.dptr_, res);
     /*
   DType grad_cpu[2];
   cudaMemcpy(grad_cpu,src_grad,sizeof(DType),cudaMemcpyDeviceToHost);
   std::cout<<grad_cpu[0]<<std::endl;
   */
-    cudaFree(Temp);
 }
 }
 

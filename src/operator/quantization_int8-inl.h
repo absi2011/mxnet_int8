@@ -113,7 +113,6 @@ class Quantization_int8Op : public Operator {
         quant_countdown=quant_countdown>0?quant_countdown-1:quant_countdown;
         init = false;
     }
-    fflush(stdout);
   }
   
 
@@ -150,7 +149,6 @@ class Quantization_int8Op : public Operator {
                         data,aux,
                         s);
     }
-    fflush(stdout);
   }
 
  private:
@@ -240,6 +238,7 @@ class Quantization_int8Prop : public OperatorProperty {
     return {out_grad[Quantization_int8::kOut], out_data[Quantization_int8::kData]};
   }
 
+  /*
   std::vector<std::pair<int, void*> > BackwardInplaceOption(
     const std::vector<int> &out_grad,
     const std::vector<int> &in_data,
@@ -247,6 +246,7 @@ class Quantization_int8Prop : public OperatorProperty {
     const std::vector<void*> &in_grad) const override {
     return {{out_grad[Quantization_int8::kOut], in_grad[Quantization_int8::kData]}};
   }
+  */
 
   std::vector<std::pair<int, void*> > ForwardInplaceOption(
     const std::vector<int> &in_data,
