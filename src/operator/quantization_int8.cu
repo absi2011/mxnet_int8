@@ -24,6 +24,8 @@
  * \author Jingqiu Zhou & Ruize Hou
 */
 
+//This code is edited by Ruize Hou, so it may have different code-style. You can reset it by clang-format.
+
 #include "./quantization_int8-inl.h"
 #include <cuda.h>
 #include <thrust/extrema.h>
@@ -34,11 +36,12 @@
 
 #define QUANT_LEVEL 255
 #define THREAD_PER_BLOCK 256
+
 namespace mxnet {
 namespace op {
     template <typename DType>
     struct QUANT_WEIGHT_GPU_MINMAX {
-        __device__ static void Map(int i, DType* data, DType* out, DType* src_max, DType* src_min)
+        __device__ static void Map(int i, DType* data, DType* out, DType* src_max)
         {
             __shared__ DType quant_unit;
             __shared__ DType S_min_f;
@@ -47,8 +50,8 @@ namespace op {
             //compute quantization inside each block
             if (tidx == 0) {
 
-                S_min_f = *src_min;
                 S_max_f = *src_max;
+                S_min_f = -S_max_f;
 
                 //insure 0 in the range
                 //calculate a possible quant_unit
@@ -67,9 +70,10 @@ namespace op {
             }
 
             __syncthreads();
-            DType temp = *(data + i) > S_max_f ? S_max_f : *(data + i);
+            DType temp = data[i] > S_max_f ? S_max_f : data[i];
             temp = temp < S_min_f ? S_min_f : temp;
-            *(out + i) = floor((temp - S_min_f) / quant_unit + 0.5) * quant_unit + S_min_f;
+            //make data[i] in [S_min_f, S_max_f]
+            out[i] = floor((temp - S_min_f) / quant_unit + 0.5) * quant_unit + S_min_f;
         }
     };
 
@@ -82,15 +86,19 @@ namespace op {
 
             int tidx = threadIdx.x;
             //compute quantization inside each block
-            if (tidx < 1) {
+            if (tidx == 0) {
                 quant_unit = (::pow(2.0, ::ceil(*log2t)) * DType(2.0)) / DType(QUANT_LEVEL);
             }
 
             __syncthreads();
-            DType int8_val = DType(floor(*(data + i) / quant_unit + 0.5));
+            //quantize data[i] to int8_val
+            DType int8_val = DType(floor(data[i] / quant_unit + 0.5));
+            
             int8_val = int8_val > DType(QUANT_LEVEL / 2 - 1) ? DType(QUANT_LEVEL / 2 - 1) : int8_val;
             int8_val = int8_val < -DType(QUANT_LEVEL / 2) ? -DType(QUANT_LEVEL / 2) : int8_val;
-            *(out + i) = int8_val * quant_unit;
+            
+            //adjust it into range 
+            out[i] = int8_val * quant_unit;
         }
     };
 
@@ -101,20 +109,20 @@ namespace op {
 
             if (quant_countdown == 0 || (!is_train)) {
                 DType S_max_f = *S_act;
-                DType S_min_f = *(S_act + 1);
+                DType S_min_f = -S_max_f;
                 DType quant_unit;
                 
                 quant_unit = (S_max_f - S_min_f) / DType(QUANT_LEVEL);
                 //use i= 0 to update the recorded max/min
-                DType temp = *(data + i) > S_max_f ? S_max_f : *(data + i);     // min(data[i], S_max_f)
+                DType temp = data[i] > S_max_f ? S_max_f : data[i];     // min(data[i], S_max_f)
                 temp = temp < S_min_f ? S_min_f : temp;                           // max(temp, S_min_f)
                 
                 //Make data in [S_min_f, S_max_f]
                 
-                *(out + i) = floor((temp - S_min_f) / quant_unit + 0.5) * quant_unit + S_min_f;
+                out[i] = floor((temp - S_min_f) / quant_unit + 0.5) * quant_unit + S_min_f;
                 
             } else {
-                *(out + i) = *(data + i);
+                out[i] = data[i];
                 // Just copy it.
             }
         }
@@ -122,28 +130,22 @@ namespace op {
 
     template <typename DType>
     struct UPDATE_MINMAX {
-        __device__ static void Map(int i, DType* S_act, DType* max_S, DType* min_S, DType decay, bool init, bool is_train)
+        __device__ static void Map(int i, DType* S_act, DType* max_S, DType decay, bool init, bool is_train)
         {
             if (is_train) {
                 DType S_max_f = *S_act;
-                DType S_min_f = *(S_act + 1);
                 if (init) {
                     S_max_f = *max_S;
-                    S_min_f = *min_S;
                 } else {
-                    S_max_f = *S_act * decay + (1 - decay) * (*max_S);
-                    S_min_f = *(S_act + 1) * decay + (1 - decay) * (*min_S);
+                    S_max_f = (*S_act) * decay + (1 - decay) * (*max_S);
                 }
                 if (S_max_f < 1e-6) {
                     S_max_f = 1e-6;
                 }
-                if (S_min_f > -1e-6) {
-                    S_min_f = -1e-6;
-                }
                 *S_act = S_max_f;
-                *(S_act + 1) = S_min_f;
             }
         }
+        //Update with EMA.
     };
 
     /*
@@ -194,29 +196,31 @@ namespace op {
     
     template <typename DType>
     struct GRAD_POWER2 {
-        __device__ static void Map(int i, DType* data, DType* gdata, DType* out, DType* log2t)
+        __device__ static void Map(int i, DType* data, DType* grad, DType* gdata, DType* log2t)
         {
             __shared__ DType quant_unit;
 
             int tidx = threadIdx.x;
             //compute quantization inside each block
-            if (tidx < 1) {
+            if (tidx == 0) {
                 quant_unit = (::pow(2.0, ::ceil(*log2t)) * DType(2.0)) / DType(QUANT_LEVEL);
             }
             __syncthreads();
 
-            DType int8_val = DType(floor(*(data + i) / quant_unit + 0.5));
+            DType int8_val = DType(floor(data[i] / quant_unit + 0.5));
             //int8_val=int8_val>DType(QUANT_LEVEL/2-1)?DType(QUANT_LEVEL/2-1):int8_val;
             //int8_val=int8_val<-DType(QUANT_LEVEL/2)?-DType(QUANT_LEVEL/2):int8_val;
-            DType dv_ds = int8_val - (*(data + i) / quant_unit);
+            DType dv_ds = int8_val - (data[i] / quant_unit);
             if (int8_val > DType(QUANT_LEVEL / 2 - 1)) {
                 dv_ds = DType(QUANT_LEVEL / 2 - 1);
             } else if (int8_val < -DType(QUANT_LEVEL / 2)) {
                 dv_ds = -DType(QUANT_LEVEL / 2);
             }
+            //as the paper written
+            
             DType local_grad = logf(2.0) * quant_unit * dv_ds;
-
-            *(out + i) = *(gdata + i) * local_grad;
+            
+            *(gdata + i) = *(grad + i) * local_grad;
         }
     };
 
@@ -228,28 +232,30 @@ namespace op {
 
             int tidx = threadIdx.x;
             //compute quantization inside each block
-            if (tidx < 1) {
+            if (tidx == 0) {
                 quant_unit = (::pow(2.0, ::ceil(*log2t)) * DType(2.0)) / DType(QUANT_LEVEL);
             }
             __syncthreads();
 
-            DType int8_val = DType(floor(*(data + i) / quant_unit + 0.5));
+            DType int8_val = DType(floor(data[i] / quant_unit + 0.5));
             DType factor = int8_val > DType(QUANT_LEVEL / 2 - 1) ? DType(0.) : DType(1.);
             factor = int8_val < -DType(QUANT_LEVEL / 2) ? DType(0.) : factor;
-            //printf("%.10lf\n",*(gdata + i));
-            *(out + i) = *(gdata + i) * factor;
+            
+            out[i] = *(gdata + i) * factor;
         }
     };
 
     template <typename DType>
     struct INIT_LOG2T {
-        __device__ static void Map(int i, DType* log2t, DType* max_val, DType* min_val)
+        __device__ static void Map(int i, DType* log2t, DType* max_val)
         {
-            DType t = DType(::abs(*max_val) > ::abs(*min_val) ? std::abs(*max_val) : std::abs(*min_val));
+            DType t = (*max_val);
             t = t > DType(1.) ? t : DType(1.);
             *(log2t) = log2f(t);
             *(log2t + 1) = DType(0.);
             *(log2t + 2) = DType(0.);
+            //*(log2t) means the f (s = 2^f)
+            //*(log2t + 1) && *(log2t + 2) is used to update f.
         }
     };
 
@@ -269,6 +275,8 @@ namespace op {
             *(log2t) -= alpha * tanhf(mt / (sqrtf(vt) + epsilon));
         }
     };
+    /*
+    //This code is replaced by thrust.
     template <typename DType>
     struct REDUCE_POWER2 {
         __device__ static void Map(int i, DType* grad_src, DType* grad_dst, int pre_num)
@@ -301,17 +309,30 @@ namespace op {
             }
         }
     };
+    */
 }
 }
 namespace mshadow {
+//This is Find the max of abs(src)
 template <typename DType>
-void Find_minmax(int num, DType * src, DType * max_target, DType * min_target)
+void Find_max(int num, DType * src, DType * max_target)
 {
     DType* temp;
     temp = thrust::max_element(thrust::device, src, src + num);
-    cudaMemcpy(max_target, temp, sizeof(DType), cudaMemcpyDeviceToDevice);
+    DType max_val, min_val;
+    cudaMemcpy(&max_val, temp, sizeof(DType), cudaMemcpyDeviceToHost);
     temp = thrust::min_element(thrust::device, src, src + num);
-    cudaMemcpy(min_target, temp, sizeof(DType), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(&min_val, temp, sizeof(DType), cudaMemcpyDeviceToHost);
+    //And we need max(max_val, -min_val) to get the max of abs.
+    min_val = -min_val;
+    if (max_val > min_val)
+    {
+        cudaMemcpy(max_target, &max_val, sizeof(DType), cudaMemcpyHostToDevice);
+    }
+    else
+    {
+        cudaMemcpy(max_target, &min_val, sizeof(DType), cudaMemcpyHostToDevice);
+    }
 }
 /*
 // This code maybe faster. But we didn't confirm whether it is correct or wrong.
@@ -368,25 +389,19 @@ void quantization_int8_weight(std::string qmod, Tensor<gpu, 3, DType> data, Tens
     if (qmod == std::string("minmax") || init) {
         //declare space for reduction
         DType* target_max;
-        DType* target_min;
         cudaMalloc((void**)&target_max, sizeof(DType));
-        cudaMalloc((void**)&target_min, sizeof(DType));
         //perfrom reduction , fing min max
-        Find_minmax(num, data.dptr_, target_max, target_min);
+        Find_max(num, data.dptr_, target_max);
         //perform quantization
-        mxnet::op::mxnet_op::Kernel<mxnet::op::QUANT_WEIGHT_GPU_MINMAX<DType>, gpu>::Launch(s, num, data.dptr_, out.dptr_, target_max, target_min);
+        mxnet::op::mxnet_op::Kernel<mxnet::op::QUANT_WEIGHT_GPU_MINMAX<DType>, gpu>::Launch(s, num, data.dptr_, out.dptr_, target_max);
         cudaFree(target_max);
-        cudaFree(target_min);
     } else if (qmod == std::string("power2")) {
         if (init) {
             DType* target_max;
-            DType* target_min;
             cudaMalloc((void**)&target_max, sizeof(DType));
-            cudaMalloc((void**)&target_min, sizeof(DType));
-            Find_minmax(num, data.dptr_, target_max, target_min);
-            mxnet::op::mxnet_op::Kernel<mxnet::op::INIT_LOG2T<DType>, gpu>::Launch(s, 1, aux.dptr_, target_max, target_min);
+            Find_max(num, data.dptr_, target_max);
+            mxnet::op::mxnet_op::Kernel<mxnet::op::INIT_LOG2T<DType>, gpu>::Launch(s, 1, aux.dptr_, target_max);
             cudaFree(target_max);
-            cudaFree(target_min);
         }
         mxnet::op::mxnet_op::Kernel<mxnet::op::QUANT_WEIGHT_GPU_POWER2<DType>, gpu>::Launch(s, num,
             data.dptr_, out.dptr_,
@@ -402,28 +417,22 @@ void quantization_int8_act(std::string qmod, Tensor<gpu, 3, DType> data, Tensor<
     //int offset = (num + 2 * THREAD_PER_BLOCK) / (2 * THREAD_PER_BLOCK);
     if (qmod == std::string("minmax")) {
         DType* target_max;
-        DType* target_min;
         cudaMalloc((void**)&target_max, sizeof(DType));
-        cudaMalloc((void**)&target_min, sizeof(DType));
         //find the max and min first
-        Find_minmax(num, data.dptr_, target_max, target_min);
+        Find_max(num, data.dptr_, target_max);
         //Then, update the min and max
-        mxnet::op::mxnet_op::Kernel<mxnet::op::UPDATE_MINMAX<DType>, gpu>::Launch(s, 1, aux.dptr_, target_max, target_min, decay, init, is_train);
+        mxnet::op::mxnet_op::Kernel<mxnet::op::UPDATE_MINMAX<DType>, gpu>::Launch(s, 1, aux.dptr_, target_max, decay, init, is_train);
         //At last, caculate the result
         mxnet::op::mxnet_op::Kernel<mxnet::op::QUANT_ACT_GPU_MINMAX<DType>, gpu>::Launch(s, num, data.dptr_, out.dptr_, aux.dptr_, quant_countdown, is_train);
         cudaFree(target_max);
-        cudaFree(target_min);
     } else if (qmod == std::string("power2")) {
         if (init) {
             DType* target_max;
-            DType* target_min;
 
             cudaMalloc((void**)&target_max, sizeof(DType));
-            cudaMalloc((void**)&target_min, sizeof(DType));
-            Find_minmax(num, data.dptr_, target_max, target_min);
-            mxnet::op::mxnet_op::Kernel<mxnet::op::INIT_LOG2T<DType>, gpu>::Launch(s, 1, aux.dptr_, target_max, target_min);
+            Find_max(num, data.dptr_, target_max);
+            mxnet::op::mxnet_op::Kernel<mxnet::op::INIT_LOG2T<DType>, gpu>::Launch(s, 1, aux.dptr_, target_max);
             cudaFree(target_max);
-            cudaFree(target_min);
         }
         fflush(stdout);
         mxnet::op::mxnet_op::Kernel<mxnet::op::QUANT_WEIGHT_GPU_POWER2<DType>, gpu>::Launch(s, num,
@@ -458,6 +467,7 @@ void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gp
     printf("%lld %lld\n",(long long)grad.dptr_, (long long)gdata.dptr_);
     //Test Code End
     */
+    //The gdata is only a temporary variable here. The GRAD_WEIGHT_POWER2 is where it get the true value.
     mxnet::op::mxnet_op::Kernel<mxnet::op::GRAD_POWER2<DType>, gpu>::Launch(s, num, data.dptr_, grad.dptr_, gdata.dptr_, aux.dptr_);
     /*
   DType ori_grad_cpu[3];
@@ -466,8 +476,8 @@ void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gp
   cudaMemcpy(ori_grad_cpu+2,gdata.dptr_,sizeof(DType),cudaMemcpyDeviceToHost);
   std::cout<<ori_grad_cpu[0]<<" "<<ori_grad_cpu[1]<<" "<<ori_grad_cpu[2]<<std::endl;
   */
-    //reduce gradient for threash hold
     /*
+    //reduce gradient for threash hold
     int offset = (num + 2 * THREAD_PER_BLOCK) / (2 * THREAD_PER_BLOCK);
     DType* Temp;
     cudaMalloc((void**)&Temp, sizeof(DType) * offset * 2);
@@ -507,6 +517,7 @@ void quantization_grad(std::string qmod, Tensor<gpu, 3, DType>& gdata, Tensor<gp
     mxnet::op::mxnet_op::Kernel<mxnet::op::GRAD_WEIGHT_POWER2<DType>, gpu>::Launch(s, num, data.dptr_, grad.dptr_, gdata.dptr_, aux.dptr_);
     //update aux
     cudaMemcpy(res, &temp, sizeof(DType), cudaMemcpyHostToDevice);
+    //Move it to a CUDA memory. Then it can launch the UPDATE_LOG2T correctly.(It is execute in cuda.)
     mxnet::op::mxnet_op::Kernel<mxnet::op::UPDATE_LOG2T<DType>, gpu>::Launch(s, 1, aux.dptr_, res);
     /*
   DType grad_cpu[2];

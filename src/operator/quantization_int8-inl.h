@@ -145,9 +145,7 @@ class Quantization_int8Op : public Operator {
     if(param_.quant_mod==std::string("minmax")){
       mshadow::Copy(gdata, grad, s);
     } else if(param_.quant_mod==std::string("power2")){
-      quantization_grad(param_.quant_mod,gdata,grad,
-                        data,aux,
-                        s);
+      quantization_grad(param_.quant_mod,gdata,grad,data,aux,s);
     }
   }
 
@@ -231,6 +229,7 @@ class Quantization_int8Prop : public OperatorProperty {
   }
 
   // decalre dependency and inplace optimization options
+  /*
   std::vector<int> DeclareBackwardDependency(
     const std::vector<int> &out_grad,
     const std::vector<int> &in_data,
@@ -238,7 +237,6 @@ class Quantization_int8Prop : public OperatorProperty {
     return {out_grad[Quantization_int8::kOut], out_data[Quantization_int8::kData]};
   }
 
-  /*
   std::vector<std::pair<int, void*> > BackwardInplaceOption(
     const std::vector<int> &out_grad,
     const std::vector<int> &in_data,
